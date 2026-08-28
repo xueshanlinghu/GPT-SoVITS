@@ -58,18 +58,22 @@ def main():
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
 
-    mp.spawn(
-        run,
-        nprocs=n_gpus,
-        args=(
-            n_gpus,
-            hps,
-        ),
-    )
+    if n_gpus == 1:
+        run(0, n_gpus, hps)
+    else:
+        mp.spawn(
+            run,
+            nprocs=n_gpus,
+            args=(
+                n_gpus,
+                hps,
+            ),
+        )
 
 
 def run(rank, n_gpus, hps):
     global global_step
+    use_ddp = torch.cuda.is_available() and n_gpus > 1
     if rank == 0:
         logger = utils.get_logger(hps.data.exp_dir)
         logger.info(hps)
@@ -77,12 +81,13 @@ def run(rank, n_gpus, hps):
         writer = SummaryWriter(log_dir=hps.s2_ckpt_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.s2_ckpt_dir, "eval"))
 
-    dist.init_process_group(
-        backend="gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl",
-        init_method="env://?use_libuv=False",
-        world_size=n_gpus,
-        rank=rank,
-    )
+    if use_ddp:
+        dist.init_process_group(
+            backend="gloo" if os.name == "nt" else "nccl",
+            init_method="env://?use_libuv=False",
+            world_size=n_gpus,
+            rank=rank,
+        )
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -196,10 +201,10 @@ def run(rank, n_gpus, hps):
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
-    if torch.cuda.is_available():
+    if use_ddp:
         net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
         net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
-    else:
+    elif not torch.cuda.is_available():
         net_g = net_g.to(device)
         net_d = net_d.to(device)
 
@@ -232,14 +237,10 @@ def run(rank, n_gpus, hps):
         ):
             if rank == 0:
                 logger.info("loaded pretrained %s" % hps.train.pretrained_s2G)
+            model_g = net_g.module if hasattr(net_g, "module") else net_g
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2G,
-                net_g.module.load_state_dict(
-                    torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
-                    strict=False,
-                )
-                if torch.cuda.is_available()
-                else net_g.load_state_dict(
+                model_g.load_state_dict(
                     torch.load(hps.train.pretrained_s2G, map_location="cpu", weights_only=False)["weight"],
                     strict=False,
                 ),
@@ -251,14 +252,11 @@ def run(rank, n_gpus, hps):
         ):
             if rank == 0:
                 logger.info("loaded pretrained %s" % hps.train.pretrained_s2D)
+            model_d = net_d.module if hasattr(net_d, "module") else net_d
             print(
                 "loaded pretrained %s" % hps.train.pretrained_s2D,
-                net_d.module.load_state_dict(
+                model_d.load_state_dict(
                     torch.load(hps.train.pretrained_s2D, map_location="cpu", weights_only=False)["weight"], strict=False
-                )
-                if torch.cuda.is_available()
-                else net_d.load_state_dict(
-                    torch.load(hps.train.pretrained_s2D, map_location="cpu", weights_only=False)["weight"],
                 ),
             )
 
@@ -476,9 +474,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     }
                 )
 
-                # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
-                # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
-                # scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
+                # scalar_dict.update({"loss/g/{}".format(i): v for i, x in enumerate(losses_gen)})
+                # scalar_dict.update({"loss/d_r/{}".format(i): v for i, x in enumerate(losses_disc_r)})
+                # scalar_dict.update({"loss/d_g/{}".format(i): v for i, x in enumerate(losses_disc_g)})
                 image_dict = None
                 try:  ###Some people installed the wrong version of matplotlib.
                     image_dict = {
@@ -607,24 +605,14 @@ def evaluate(hps, generator, eval_loader, writer_eval):
                 ssl = ssl.to(device)
                 text, text_lengths = text.to(device), text_lengths.to(device)
             for test in [0, 1]:
-                y_hat, mask, *_ = (
-                    generator.module.infer(
-                        ssl,
-                        spec,
-                        spec_lengths,
-                        text,
-                        text_lengths,
-                        test=test,
-                    )
-                    if torch.cuda.is_available()
-                    else generator.infer(
-                        ssl,
-                        spec,
-                        spec_lengths,
-                        text,
-                        text_lengths,
-                        test=test,
-                    )
+                generator_to_infer = generator.module if hasattr(generator, "module") else generator
+                y_hat, mask, *_ = generator_to_infer.infer(
+                    ssl,
+                    spec,
+                    spec_lengths,
+                    text,
+                    text_lengths,
+                    test=test,
                 )
                 y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
 
